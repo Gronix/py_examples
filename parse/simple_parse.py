@@ -104,7 +104,7 @@ def main(cfg):
 
 
 	# извлекаем из них частотный словарь
-	print('counting words... [please wait - about 3 minutes] ', end='', flush=True)
+	print('counting words... [please wait - about minute] ', end='', flush=True)
 	words_counts = Counter()
 
 	# параметр 'i' - для тестирования
@@ -122,13 +122,13 @@ def main(cfg):
 	with Image.open(io.BytesIO(urlopen(cfg['image_url']).read())) as img:
 		print('printing image... ', end='', flush=True)
 		img_mask = np.array(img)
-		wc = wcloud(width=800,
-					height=165,
+		wc = wcloud(width=1100,
+					height=1100,
 					min_font_size=1,
 					background_color=cfg['bg_color'],
 					max_words=cfg['cloud_max_wrds'], 
 					mask=img_mask,
-					max_font_size=50, 
+					max_font_size=80, 
 					random_state=42)
 		wc.generate_from_frequencies(words_counts)
 		image_colors = ImageColorGenerator(img_mask)
@@ -148,7 +148,7 @@ cfg = {'params': {'q': 'Russia',
 	'url': 
 		'https://news.google.com/_/rss/search',
 	'image_url': 
-		'https://raw.githubusercontent.com/Gronix/py_examples/master/parse/Python.png',
+		'https://lh5.googleusercontent.com/dsOWR_WRQx8YvxJbX_k_BJOsH9ik1EtIELWpkPwZ4MAXJ1RioaRqwSlgzpmi8BP4lUIpGKMXDahKt9dNaycj=w1267-h620-rw',
 	'bg_color': 
 		'#FFFFFF',
 	'cloud_max_wrds': 2000,
@@ -171,7 +171,7 @@ cfg = {'params': {'q': 'Russia',
 		'two', 'how', 'our', 'work', 'well', 'way', 'even', 'new', 'want', 
 		'because', 'any', 'these', 'give', 'day', 'most', 'us', 's',
 		'is', 'has', 'are', 'had', 'such', 'was', 'those', 'said', 'did', 
-		'u', 't', 'were', 'more', 'been']
+		'u', 't', 'were', 'more', 'been', 'quot']
 	}
 
 # чтобы из интерпретатора запускать функции вручную, а из консоли работать как и запланировано.
