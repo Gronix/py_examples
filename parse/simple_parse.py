@@ -148,7 +148,7 @@ cfg = {'params': {'q': 'Russia',
 	'url': 
 		'https://news.google.com/_/rss/search',
 	'image_url': 
-		'https://drive.google.com/uc?authuser=0&id=1oFJ1CCZtaVBywcEtDOKgkzepHwjc7sTM&export=download',
+		'https://raw.githubusercontent.com/Gronix/py_examples/master/parse/Python.png',
 	'bg_color': 
 		'#FFFFFF',
 	'cloud_max_wrds': 2000,
