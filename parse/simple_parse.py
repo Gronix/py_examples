@@ -40,8 +40,8 @@ from PIL import Image
 import numpy as np
 import io
 
-# специальный обработчик для запуска в асинхроне блокирующей функции на множестве аргументов
 def godfather_of_asyncs(func, list_of_args):
+	"""Специальный обработчик для запуска в асинхроне блокирующей функции на множестве аргументов"""
 	i = 0
 	loop = asyncio.get_event_loop()
 	tasks = [asyncio.ensure_future(async_wrapper(func, arg)) for arg in list_of_args]
@@ -50,13 +50,14 @@ def godfather_of_asyncs(func, list_of_args):
 	loop.close()
 	return results
 
-# запускает блокирующую функцию в отдельном потоке
 async def async_wrapper(func, args):
+	"""Async функция запуска блокирующей функции в отдельном потоке (реализации асинхронности с urllib)"""
 	loop = asyncio.get_event_loop()
 	_future = await loop.run_in_executor(None, func, *args)
 	return _future
 
 def get_word_counts_from_page(url, i=-1):
+	"""Получение частотного словаря (Counter) из контента страницы по url"""
 	# print('{}\t#{} in process...'.format(i, url))
 
 	r = Request(url, data=None, headers={'User-Agent': cfg['User-Agent']})
@@ -84,6 +85,7 @@ def get_word_counts_from_page(url, i=-1):
 	return c
 
 def main(cfg):
+	"""Парсит news.google.com, собирает в асинхроне частотные словари со статей по ссылкам, по ним строит облако слов"""
 	u = cfg['url'] + '?' + \
 			'&'.join(['{}={}'.format(k,v) for k,v in cfg['params'].items()])
 
@@ -104,14 +106,14 @@ def main(cfg):
 
 
 	# извлекаем из них частотный словарь
-	print('counting words... [please wait - about minute] ', end='', flush=True)
+	print('counting words... [please wait - about 2 minutes] ', end='', flush=True)
 	words_counts = Counter()
 
 	# параметр 'i' - для тестирования
 	# urls = [(url, i) for url, i  in zip(urls, range(1, 1000000))]
 	# это преобразования для того, чтобы функции-обёртки могли верно распаковать параметры для оборачиваемой функции: *par
 	urls = [(url,) for url in urls]
-	results = godfather_of_asyncs(get_word_counts_from_page, urls[:10])
+	results = godfather_of_asyncs(get_word_counts_from_page, urls)
 	for res in results:
 		words_counts += res
 	for word in cfg['banned_words']:

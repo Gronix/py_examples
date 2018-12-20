@@ -1,26 +1,25 @@
 '''
-Программа по подсчёту констант для лингвистической модели Кнессера-Нея (3-gram)
+Программа по подсчёту констант для лингвистической модели Кнесера-Нея (3-gram)
 
 Шаги выполнения программы:
 + Извлекается Counter для n-gram
-+ Ключи если нужно модифицируются
-+ Исходный массив задач разбивается на непересекающиеся отрезки (!), т.е.
-    чтобы в разных корзинах не лежали n-gram'ы с общим префиксом. Это нужно
-    для возможности конструирования дерева в несколько процессов (чтобы не 
-    возникало ошибок синхронизации)
++ Ключи если нужно модифицируются (для извлечения в дальнейшем разных коэффициентов)
++ Исходный массив задач разбивается на непересекающиеся отрезки (!), 
+    [т.е. чтобы в разных корзинах не лежали n-gram'ы с общим префиксом. Это 
+    нужно для возможности конструирования дерева в несколько процессов, так 
+    не возникает ошибок синхронизации]
     И собирается в большой словарь где каждому каждому ключу соответствует 
-    список пар (key-value), с единым префиксом.
-+ Элементы словаря (т.е. списки) заносятся в расшаренную очередь, где её разбирают 
-    worker'ы, конструируя непересекающиеся ветки этого trie
-+ В конце дерево сохраняется
+    список пар (k-gram(=префикс) : [список полдолжений]).
++ Элементы словаря (т.е. списки пар) заносятся в расшаренную очередь, где её разбирают 
+    worker'ы, конструируя непересекающиеся ветки этого trie.
++ В конце дерево сохраняется.
 
 Обработка этих констант и просчёт уже самих вероятностей для модели дело нехитрое и вынесено 
 по технической необходимости в отдельный файл, который здесь не рассматривается.
 
-Особенность задачи в том, что т.к. данных очень много (unigram: 3 млн, bigram: 15 млн, trigram: 18 млн),
-то конструирование дерева занимает тоже достаточно времени. Чтобы это ускорить - нужно задачу разделить
-между процессорами. Из-за GIL в Python нельзя с помощью потоков ускорить программу. Приходится
-прибегать к мультипроцессности держа в голове все издержки и особенности такого подхода.
+Особенность задачи в большом количестве данных (unigram: 3 млн, bigram: 15 млн, trigram: 18 млн),
+из-за него конструирование дерева занимает достаточно много времени. 
+Чтобы это исправить программа была распараллелена.
 '''
 
 
@@ -152,8 +151,6 @@ class Trie:
         self.root._del()
         del self
 
-MyManager.register('Trie', Trie)
-
 def worker(shared_trie, count_of_jobs, jobs_done_at_this_time, prev_done_percent, jobs_queue, lock_obj):
     while True:
         job = jobs_queue.get()
@@ -173,7 +170,7 @@ def worker(shared_trie, count_of_jobs, jobs_done_at_this_time, prev_done_percent
         finally:
             lock_obj.release()
 
-def parallel_gets_jobs(pairs_list):
+def simple_job_creator(pairs_list):
     jobs_dict = defaultdict(list)
     for k,v in pairs_list:
         key = k[0]
@@ -182,24 +179,28 @@ def parallel_gets_jobs(pairs_list):
     sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
     return jobs_dict
 
-def construct_dict_with_modified_keys(dct, mode='rev',k=3):
-    def _rev3(tup_key):
-        return tup_key[2], tup_key[1], tup_key[0]
-    def _mid3(tup_key): # ONLY FOR tup_key LENGHT = 3
+
+# для ключей словаря, обрабатывать которые не нужно - функция вызываться не должна
+def modify_dict_keys(dct, mode = 'rev', k = 3):
+    """Создание нового словаря с модифицированными ключами: 
+        'rev' - перевернётые, [(3,2,1) и (2,1)]
+        'mid' - "подвешенные" за середину (только при k == 3 (!)) [(2,1,3)]
+    """
+    def _rev(tup_key):
+        return tuple(reversed(tup_key))
+    def _mid3(tup_key):
         return tup_key[1], tup_key[0], tup_key[2]
-    def _rev2(tup_key):
-        return tup_key[1], tup_key[0]
 
     dct_new = {}
     if k == 3:
         if mode == 'rev':
-            key_modif = _rev3
+            key_modif = _rev
             print('rev 3 mode set')
         else:
             key_modif = _mid3
             print('mid 3 mode set')
     else:
-        key_modif = _rev2
+        key_modif = _rev
         print('rev 2 mode set')
         
     sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
@@ -209,126 +210,156 @@ def construct_dict_with_modified_keys(dct, mode='rev',k=3):
 
     return dct_new
 
-# FILE_NAME    CPUs    PARTS_AT_CPU    MODIFY_KEYS?    LOAD_counter_list?
-#     1         2           3               4                   5 (просто _)
-if __name__ == "__main__":
-    with open(sys.argv[1], 'rb') as f:
-        q = Queue()
-        if len(sys.argv) < 3:
-            num_of_working_cpus = cpu_count()
-            num_of_tasks = 3
+# регистрация класса, к объекту которого будет предоставляться доступ в общей для процессов памяти
+MyManager.register('Trie', Trie)
+
+def split_counter_to_buckets(counter_obj, args, n):
+    '''Разбиение общего частотного словаря по корзинам с обработкой ключей, для дальнейших паралелльных вычислений'''
+
+    print('creating jobs...', end='', flush=True)
+    boards_num = args.cpusn * args.partsn
+    size = len(counter_obj)
+    boards = [int(i * size / boards_num) for i in range(boards_num)]
+    boards.append(size)
+
+    # Если нужно, тогда модифицируем ключи (например, для подсчёта некоторых констант 
+    # trie дерево должно быть построено на обратных 2-3-грамах)
+    if args.key_mode != 'no':
+        counter_obj = modify_dict_keys(counter_obj, args.key_mode, args.k)
+
+    # разбиваем получившийся частотный словарь на списки для pool.map (конструировать)
+    items_in_buckets = list(counter_obj)
+    items_in_buckets = [ [ items_in_buckets[boards[i] : boards[i+1]] ] for i in range(boards_num)]
+
+    return items_in_buckets
+
+
+def jobs_construct(items_in_buckets, num_of_working_cpus):
+    '''Конструирование словаря n-gram у которых общий единичный префикс (первый токен)'''
+
+    pool = Pool(num_of_working_cpus)
+    task_list = [pool.apply_async(simple_job_creator, bucket) for bucket in items_in_buckets]
+    for task in task_list:
+        task.wait()
+    print('dict with common prefixes done. ', end='', flush=True)
+
+    first_phase = True
+    jobs_dict = {}
+    for dct in [task.get() for task in task_list]:
+        if first_phase:
+            jobs_dict = dct
+            first_phase = false
         else:
-            num_of_working_cpus = int(sys.argv[2])
-            num_of_tasks = int(sys.argv[3])
-        pool = Pool(num_of_working_cpus)
+            n = len(dct)
+            for prefix, continuation_list in dct.items():
+                jobs_dict[prefix] += continuation_list
+    print('parts joined. ', end='', flush=True)
+    pool.close()
+    pool.join()
+    return jobs_dict
 
-        if len(sys.argv) != 6:
-            counter_obj = pickle.load(f)            
-            print('file loaded')
-            sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
 
-            k = len(list(counter_obj.keys())[0])
-            print('k=' + str(k))
-            sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+def overseer_on_workers(num_of_cpus, workers_args):
+    '''Запуск "рабочих" по числу процессоров из "CPUs num", ожидание завершения их работы'''
+    
+    # чтобы каждый процесс получил своё None-значение сигнализирующее о завершении работы
+    for i in range(num_of_cpus):
+        q.put(None)
 
-            brd_count = num_of_working_cpus * num_of_tasks
-            n = len(counter_obj)
-            boards = [int(i*n/brd_count) for i in range(brd_count)]
-            boards.append(n)
+    processes = []
+    for cpu in range(num_of_cpus):
+        proc = Process(target=worker, args=workers_args)
+        processes.append(proc)
+        proc.start()
 
-            # Если нужно, тогда модифицируем ключи (например, для подсчёта некоторых констант 
-            # trie дерево должно быть построено на обратных 2-3-грамах)
-            if len(sys.argv) >= 4 and sys.argv[4] != 'no':
-                _counter_obj = construct_dict_with_modified_keys(counter_obj, sys.argv[4], k)
-                del counter_obj
-                counter_obj = _counter_obj
-                del _counter_obj
+    # ждём пока работа выполнится
+    for p in processes:
+        p.join()
 
-            _counts = list(counter_obj.items())
-            del counter_obj
-            counters_list = [[_counts[boards[i]:boards[i+1]]] for i in range(brd_count)]
-            with open('counter_list.bin','wb') as f:
-                pickle.dump(counters_list, f)
-            del _counts
-        else:   
-            counters_list = pickle.load(f)
-            brd_count = len(counters_list)
-            print('file loaded')
 
-        print('constructed counter_list for parallel calculationg jobs!')
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+def arg_parser_configurator():
+    '''Настройка 'argparse' - стандартного парсера коммандной строки python.'''
 
-        tl = [pool.apply_async(parallel_gets_jobs, counters_part) for counters_part in counters_list]
+    arg_parser = argparse.ArgumentParser(description='Main goal of this program is \
+                            preparing to calculate Kneser-Ney language model constants from Trie.\
+                            Execute only from terminal.')
+    arg_parser.add_argument('file_name', 
+                        type=str,
+                        help='Name of file contains counts for n-grams, processed \
+                        in previous stage of algo.')
+    arg_parser.add_argument('-k', '--k_gram', 
+                        dest='k', action='store', type=int, default=1,
+                        help='Current k-gram part of n-grams to build Trie.')
+    arg_parser.add_argument('-c', '--cpus', 
+                        dest='cpusn', action='store', type=int, default=3,
+                        help='Number of CPUs to use.')  
+    arg_parser.add_argument('-p', '--parts_num', 
+                        dest='partsn', action='store', type=int, default=3,
+                        help='Number of data chunks processed per one CPU.')
+    arg_parser.add_argument('-m', '--keys_modify', 
+                        dest='key_mode', action='store', type=str, 
+                        choices=['rev', 'mid', 'no'], default='no',
+                        help='Modify dictionary keys mode.\
+                        rev = inverted,\
+                        mid = middle part at first [2,1,3],\
+                        no = stay as is (default))')
+    return arg_parser
 
-        print('jobs construction (' + str(brd_count) + ' separated tasks): ', end = '', flush=True)
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
-        for task in tl:
-            task.wait()
-        print(' calculated')
 
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
-        i = 0
-        jobs_dict = {}
+def main(arg_parser):
+    '''Распараллеленное конструирование Trie для дальнейшего подсчёта коэффициентов \
+    языковой модели из частотного словаря k-gram'''
 
-        print('work with...')
-        for dct in [res.get() for res in tl]:
-            print(' ' + str(i+1) + ' part: ', end='', flush=True)
-            sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
-            if i == 0:
-                jobs_dict = dct
-            else:
-                j = 0
-                next_done_percent_border = 10
-                n = len(dct)
-                for k, list_of_values in dct.items():
-                    jobs_dict[k] += list_of_values
-                    j += 1
-                    if int(100*j/n) == next_done_percent_border:
-                        print(str(int(100*j/n)) + '% ', end='', flush=True)
-                        next_done_percent_border += 10
-            i += 1
-            print('inserted')
-            sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+    # arg_parser = arg_parser_configurator()
+    args = arg_parser.parse_args()
+    __doc__ = arg_parser.description
 
-        pool.close()
-        pool.join()
-        print('jobs dict constructed')
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+    try:
+        with open(arg_parser.fname) as file:
+            counters_list = pickle.load(file)
+            print('split counter to buckets...', end='', flush=True)
+            buckets_of_counter_items = split_counter_to_buckets(counters_list[args.k], args)
+            del counters_list
+            print('done')
 
-        for v in jobs_dict.values():
-            q.put(v)
-        print(str(len(jobs_dict)) + ' jobs putted into queue')
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+    except FileNotFoundError:
+        print('File with name "{}" was not found! Exit.'.format(arg))
+        sys.exit()
+    except:
+        print('Some strange thing was occured... Closing.')
+        sys.exit()
 
-        v_jobs_count = Value('i', len(jobs_dict), lock=False)
-        v_jobs_done_incr = Value('i', 0, lock=False)
-        v_jobs_done_pref_procent = Value('i', 0, lock=False)
+    print('jobs construction... ', end='', flush=True)
+    jobs_construct(buckets_of_counter_items, args.cpusn)
+    print('done.')
 
-        lock = Lock()
-        manager = _Manager()
-        shared_trie_instance = manager.Trie()
-        # task_list = [pool.apply_async(trie.construct_from_pairs, (shared, v_jobs_count, v_jobs_done_incr, q, lock)) for tup in k_brds[0]]
-        for cpu in range(num_of_working_cpus):
-            q.put(None)
+    print('preparing shared variables... ', end='', flush=True)
+    q = Queue()
+    for v in jobs_dict.values():
+        q.put(v)
+    print('[{} jobs in queue] '.format(len(jobs_dict)), end='', flush=True)
 
-        arguments = (shared_trie_instance, v_jobs_count, v_jobs_done_incr, v_jobs_done_pref_procent, q, lock)
-        procs = []
-        print('all arguments and variables prepared')
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+    # общие переменные только для интерактивного отслеживания прогресса
+    v_jobs_count = Value('i', len(jobs_dict), lock=False)
+    v_jobs_done_increment = Value('i', 0, lock=False)
+    v_jobs_done_previous_percent = Value('i', 0, lock=False)
 
-        for cpu in range(num_of_working_cpus):
-            proc = Process(target=worker, args=arguments)
-            procs.append(proc)
-            proc.start()
-            print(str(cpu + 1) + ' process from ' + str(num_of_working_cpus) + ' are started')
-            sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
+    lock = Lock() # будет блокировать только изменение v_jobs*'ов
+    manager = _Manager() # экземпляр менеджера класса
+    shared_trie_instance = manager.Trie() # экземпляр Trie в общей памяти под управлением MyManager
+    worker_args = (shared_trie_instance, v_jobs_count, v_jobs_done_incr, v_jobs_done_pref_procent, q, lock)
+    print('done')
 
-        for p in procs:
-            p.join()
-        
-        print('saving results... ', end='', flush=True)
+    print('begining of the work "day"...', end=False, flush=True)
+    overseer_on_workers(args.cpusn, worker_args)
+    print('done')
 
-        sys.stdout.flush() # FOR NOHUP IN GOOGLE CLOUD
-        shared_trie_instance.save()
-        print('done!')
-        print('EXIT')
+    print('saving results... ', end='', flush=True)
+    shared_trie_instance.save()
+    print('done\nExit')
+
+arg_parser = arg_parser_configurator()
+if __name__ == "main":
+    main(arg_parser)
+else:
+    arg_parser.print_help()
